@@ -1,0 +1,1020 @@
+#!/usr/bin/env bash
+###############################################################################
+# RedStack, the Reddwarf Dev Machine Controller                               #
+###############################################################################
+#                                                                             #
+# This script provides all the functionality to run all the steps from        #
+# setting up the enviornment, resetting the nova database to running the      #
+# test.                                                                       #
+#                                                                             #
+###############################################################################
+
+REDSTACK_SCRIPTS=${REDSTACK_SCRIPTS:-`pwd`}
+REDSTACK_TESTS=$REDSTACK_SCRIPTS/../tests/
+REDDWARF_CONF_DIR=/etc/reddwarf
+
+USERHOME=$HOME
+# Load options not checked into VCS.
+if [ -f $REDSTACK_SCRIPTS/options.rc ]; then
+    . $REDSTACK_SCRIPTS/options.rc
+fi
+
+# Bail on errors.
+set -e
+
+# Load global configuration variables.
+. $REDSTACK_SCRIPTS/redstack.rc
+. $REDSTACK_SCRIPTS/reviews.rc
+# allow overrides from devstack if already set
+if [ -f $PATH_DEVSTACK_SRC/localrc ]; then
+    . $PATH_DEVSTACK_SRC/localrc
+fi
+
+# Public facing bits
+SERVICE_PROTOCOL=${SERVICE_PROTOCOL:-http}
+NETWORK_GATEWAY=${NETWORK_GATEWAY:-10.0.0.1}
+KEYSTONE_AUTH_HOST=${KEYSTONE_AUTH_HOST:-$SERVICE_HOST}
+KEYSTONE_AUTH_PROTOCOL=${KEYSTONE_AUTH_PROTOCOL:-$SERVICE_PROTOCOL}
+KEYSTONE_AUTH_PORT=${KEYSTONE_AUTH_PORT:-35357}
+REDDWARF_AUTH_ENDPOINT=$KEYSTONE_AUTH_PROTOCOL://$KEYSTONE_AUTH_HOST:$KEYSTONE_AUTH_PORT/v2.0
+
+# PATH_REDDWARF more than likely has file separators, which sed does not like
+# This will escape them
+ESCAPED_PATH_REDDWARF=`echo $PATH_REDDWARF | sed 's/\//\\\\\//g'`
+ESCAPED_REDSTACK_SCRIPTS=`echo $REDSTACK_SCRIPTS | sed 's/\//\\\\\//g'`
+REDDWARF_AUTH_CACHE_DIR=${REDDWARF_AUTH_CACHE_DIR:-/var/cache/reddwarf}
+REDDWARF_LOGDIR=${REDDWARF_LOGDIR:-$REDSTACK_SCRIPTS/../report/logs}
+
+# Load functions devstack style
+. $REDSTACK_SCRIPTS/functions
+. $REDSTACK_SCRIPTS/functions_qemu
+
+if [ -f $PATH_ENV_CONF ]; then
+    source $PATH_ENV_CONF
+fi
+
+###############################################################################
+# Utility functions
+###############################################################################
+
+APT_GET_ARGS="-y --allow-unauthenticated --force-yes"
+
+function exclaim () {
+    echo "*******************************************************************************"
+    echo "$@"
+    echo "*******************************************************************************"
+}
+
+function pkg_install () {
+    echo Installing $@...
+    sudo -E DEBIAN_FRONTEND=noninteractive $HTTP_PROXY apt-get $APT_GET_ARGS install $@
+}
+
+function pkg_update () {
+    echo Updating $@...
+    sudo -E DEBIAN_FRONTEND=noninteractive $HTTP_PROXY apt-get $APT_GET_ARGS update $@
+}
+
+function set_home_dir() {
+    self="${0#./}"
+    base="${self%/*}"
+    current=`pwd`
+    if [ "$base" = "$self" ] ; then
+        HOME="$current/"
+    elif [[ $base =~ ^/ ]]; then
+        HOME="$base/"
+    else
+        HOME="$current/$base/"
+    fi
+}
+
+function set_http_proxy() {
+    if [ ! "${http_proxy}" = '' ]; then
+        HTTP_PROXY="http_proxy=$http_proxy https_proxy=$https_proxy"
+    fi
+}
+
+function echo_id_from_table () {
+    # Given a command that returns a table, prints only the id part.
+    echo `$@ | grep ' id ' | awk '{print $4}'`
+}
+
+function get_ip_for_device() {
+    /sbin/ifconfig $1 | awk '/inet addr/{gsub(/addr:/,"");print $2}'
+}
+
+function ip_chunk() {
+    # Given 1-4 returns a bit of where the ip range starts.
+    # Full IP= `ip_chunk 1`.`ip_chunk 2`.`ip_chunk 3`.`ip_chunk 4`
+    get_ip_for_device $1 | cut -d. -f$2
+}
+
+function keystone_add_user() {
+    # Adds a user. Prints the UUID to standard out.
+    USER_NAME=$1
+    USER_PASS=$2
+    USER_EMAIL=$3
+    # Create the user "reddwarf"
+    USER_UUID=`keystone --endpoint http://localhost:35357/v2.0 --token $SERVICE_TOKEN user-list | grep $USER_NAME | awk '{print $2}'`
+    if [ -z $USER_UUID ]; then
+        USER_UUID=`echo_id_from_table keystone \
+                   --endpoint http://localhost:35357/v2.0  \
+                   --token $SERVICE_TOKEN user-create \
+                   --name=$USER_NAME --pass="$USER_PASS" --email=$USER_EMAIL`
+    fi
+
+    echo $USER_UUID
+}
+
+function keystone_add_user_role() {
+    TENANT_UUID=$1
+    USER_UUID=$2
+    ROLE_UUID=$3
+    echo "keystone --endpoint http://localhost:35357/v2.0
+        --token $SERVICE_TOKEN user-role-add
+        --tenant_id $TENANT_UUID
+        --user $USER_UUID
+        --role $ROLE_UUID"
+    keystone --endpoint http://localhost:35357/v2.0 \
+        --token $SERVICE_TOKEN user-role-add \
+        --tenant_id $TENANT_UUID \
+        --user-id $USER_UUID \
+        --role-id $ROLE_UUID
+}
+
+function keystone_manage () {
+    keystone --endpoint http://localhost:35357/v2.0 --token $SERVICE_TOKEN $@
+}
+
+function get_attribute_id() {
+    keystone --endpoint $REDDWARF_AUTH_ENDPOINT --token $SERVICE_TOKEN $1-list | grep " $2 " | get_field $3
+
+}
+
+function configure_keystone_for_test_users() {
+    exclaim "Configuring keystone..."
+
+    REDDWARF_TENANT=`get_attribute_id tenant reddwarf 1`
+    ADMIN_ROLE=`get_attribute_id role admin 1`
+    REDDWARF_ROLE=`get_attribute_id role reddwarf 1`
+    DAFFY_TENANT=`get_attribute_id tenant daffy 1`
+    if [ -z $DAFFY_TENANT ]; then
+        DAFFY_TENANT=`echo_id_from_table keystone --endpoint http://localhost:35357/v2.0 --token  $SERVICE_TOKEN tenant-create --name=daffy`
+    fi
+
+    DAFFY_ROLE=`get_attribute_id role daffy 1`
+    if [ -z "$DAFFY_ROLE" ]; then
+        DAFFY_ROLE=`echo_id_from_table keystone --endpoint http://localhost:35357/v2.0 --token  $SERVICE_TOKEN role-create --name=daffy`
+    fi
+
+    #TODO(tim.simpson): Write some code here that removes the roles so these
+    #                   command won't fail if you run them twice.
+    #                   That way we will still catch errors if our calls to
+    #                   keystone fail, but can run kickstart twice w/o install.
+    set +e
+    REDDWARF_USER=`keystone_add_user Boss admin boss@example.com`
+    keystone_add_user_role $REDDWARF_TENANT $REDDWARF_USER $REDDWARF_ROLE
+    keystone_add_user_role $REDDWARF_TENANT $REDDWARF_USER $ADMIN_ROLE
+
+    REDDWARF_USER=`keystone_add_user chunk chunk chunk@example.com`
+    keystone_add_user_role $REDDWARF_TENANT $REDDWARF_USER $REDDWARF_ROLE
+
+    REDDWARF_USER=`keystone_add_user daffy daffy daffy@example.com`
+    keystone_add_user_role $DAFFY_TENANT $REDDWARF_USER $DAFFY_ROLE
+
+    REDDWARF_USER=`keystone_add_user examples examples examples@example.com`
+    keystone_add_user_role $REDDWARF_TENANT $REDDWARF_USER $REDDWARF_ROLE
+    set -e
+
+    # Add the tenant id's into test.conf
+    DEMO_TENANT=`get_attribute_id tenant demo 1`
+    sed -i "s/%reddwarf_tenant_id%/$REDDWARF_TENANT/g" $REDDWARF_CONF_DIR/test.conf
+    sed -i "s/%daffy_tenant_id%/$DAFFY_TENANT/g" $REDDWARF_CONF_DIR/test.conf
+    sed -i "s/%demo_tenant_id%/$DEMO_TENANT/g" $REDDWARF_CONF_DIR/test.conf
+    sed -i "s/%demo_key%/$ADMIN_PASSWORD/g" $REDDWARF_CONF_DIR/test.conf
+}
+
+###############################################################################
+
+
+###############################################################################
+# Install all the required dependencies
+###############################################################################
+
+function install_reddwarf_packages() {
+    # Called after devstack.
+    exclaim "Installing dependencies (part 2)..."
+    # The default version of pip Ubuntu installs is old.
+    cd /tmp
+    sudo pip install --upgrade pip
+
+    pkg_install python-pexpect
+    #TODO(tim.simpson): Install unstable branch for now.
+
+    # Needed to install client on fresh VM
+    pkg_install libxslt1-dev
+
+    exclaim "Installing Reddwarf Client..."
+    pushd $PATH_PYTHON_REDDWARFCLIENT
+    sudo python setup.py develop
+    popd
+
+    exclaim "Installing Proboscis."
+    sudo pip install openstack.nose_plugin
+    sudo pip install proboscis
+
+    pkg_install maven2
+
+    cd /tmp
+}
+
+
+function install_devstack() {
+    exclaim "Installing devstack..."
+    # Installs devstack (if needed).
+    if [ ! -d $PATH_DEVSTACK_SRC ]; then
+        echo "DevStack not in a shared folder, cloning from git."
+        mkdir -p $PATH_DEVSTACK_SRC
+        git clone $REPO_DEVSTACK $PATH_DEVSTACK_SRC
+    fi
+    cp $REDSTACK_SCRIPTS/local.sh $PATH_DEVSTACK_SRC
+}
+
+function install_diskimagebuilder() {
+    exclaim "Installing diskimage-builder..."
+    # Installs diskimage-builder (if needed).
+    if [ ! -d $PATH_DISKIMAGEBUILDER ]; then
+        echo "Cloning from git."
+        mkdir -p $PATH_DISKIMAGEBUILDER
+        git clone $REPO_DISKIMAGEBUILDER $PATH_DISKIMAGEBUILDER
+        # link files so that reddwarf and disk image builder can be updated independently
+        echo "Linking Reddwarf Elements to Disk Image Builder"
+        ln -s $REDSTACK_SCRIPTS/files/elements/reddwarf-guest $PATH_DISKIMAGEBUILDER/elements/reddwarf-guest
+        ln -s $REDSTACK_SCRIPTS/files/elements/reddwarf-mysql $PATH_DISKIMAGEBUILDER/elements/reddwarf-mysql
+        ln -s $REDSTACK_SCRIPTS/files/elements/reddwarf-percona $PATH_DISKIMAGEBUILDER/elements/reddwarf-percona
+    fi
+}
+
+function install_devstack_code() {
+    exclaim "Installing devstack projects..."
+    # Ensures present user can get to the devstack dirs
+    sudo mkdir -p $PATH_DEVSTACK_OUTPUT
+    if [ ! -w $PATH_DEVSTACK_OUTPUT ]; then
+        sudo chown `whoami` $PATH_DEVSTACK_OUTPUT
+    fi
+    # Clones all of the code to where devstack expects it to be
+    cd $PATH_DEVSTACK_OUTPUT
+    for project in glance keystone nova python-keystoneclient python-novaclient swift python-swiftclient
+    do
+      if [ ! -d $project ]; then
+          echo "Creating a new clone of $project..."
+          git clone $OPENSTACK_GITHUB/$project
+      else
+          echo "$project was already cloned or exists in a shared folder, ignoring..."
+      fi
+    done
+}
+
+function install_reviews_on_top_of_devstack() {
+    exclaim "Putting gerrit review code on top of the existing devstack code"
+    run_review_for nova $PATH_NOVA $REVIEW_NOVA
+    run_review_for python-novaclient $PATH_PYTHON_NOVACLIENT $REVIEW_PYTHON_NOVACLIENT
+    run_review_for keystone $PATH_KEYSTONE $REVIEW_KEYSTONE
+    run_review_for python-keystoneclient $PATH_KEYSTONECLIENT $REVIEW_PYTHON_KEYSTONECLIENT
+    run_review_for glance $PATH_GLANCE $REVIEW_GLANCE
+    run_review_for swift $PATH_SWIFT $REVIEW_SWIFT
+    run_review_for python-swiftclient $PATH_PYTHON_SWIFTCLIENT $REVIEW_PYTHON_SWIFTCLIENT
+}
+
+function run_review_for() {
+    # Splits based on colon in the REVIEW_ARG and pulls from
+    GIT_NAME=$1
+    PATH_ARG=$2
+    REVIEW_ARG=$3
+    for review in `echo $REVIEW_ARG| tr ":" "\n"`
+    do
+        # This should be the ref spec for what we pull
+        pushd $PATH_ARG
+        git pull https://review.openstack.org/p/openstack/$GIT_NAME refs/changes/$review
+        popd
+    done
+}
+
+function run_devstack() {
+    exclaim "Running devstack..."
+    cd $PATH_DEVSTACK_SRC
+
+    # Creating this lock directory seems sure-fire.
+    mkdir -p $USERHOME/nova_locks
+    # Kill the lock files, just in case they persist and can't be overwritten.
+    rm -rf $USERHOME/nova_locks/*
+
+    echo "
+# Set some arguments for devstack.
+# These passwords originally come from redstack.rc.
+MYSQL_PASSWORD=$MYSQL_PASSWORD
+RABBIT_PASSWORD=$RABBIT_PASSWORD
+SERVICE_TOKEN=$SERVICE_TOKEN
+ADMIN_PASSWORD=$ADMIN_PASSWORD
+SERVICE_PASSWORD=$SERVICE_PASSWORD
+FLAT_INTERFACE=br100
+REDDWARF_LOGDIR=$REDDWARF_LOGDIR
+REDDWARF_AUTH_CACHE_DIR=$REDDWARF_AUTH_CACHE_DIR
+SWIFT_HASH=$SWIFT_HASH
+# Set Cinder Volume from Redstack so that later Redstack can help manage
+# reconnecting Volume Group to Backing File
+DEST=$DEST
+DATA_DIR=$DATA_DIR
+VOLUME_GROUP=${VOLUME_GROUP}
+VOLUME_BACKING_FILE=${VOLUME_BACKING_FILE}
+# The lock_path is by default /opt/stack/nova; if this path is a shared
+# folder in VirtualBox things seem to break. We fix it by setting EXTRA_OPS
+# to force lock_path to /tmp.
+EXTRA_OPTS=(lock_path=$USERHOME/nova_locks logdir=$REDDWARF_LOGDIR logfile_mode=660 rescan_timeout=180 resizefs_timeout=240 force_dhcp_release=False host=`hostname`.`hostname --domain`)
+" > localrc
+    if [ -n "$USING_VAGRANT" ]
+    then
+        echo "
+# This is similar to code found at
+# https://github.com/bcwaldon/vagrant_devstack/blob/master/Vagrantfile
+# and seems to make instances ping'able in VirtualBox.
+FLAT_INTERFACE=eth1
+PUBLIC_INTERFACE=eth1
+FLOATING_RANGE=`ip_chunk eth0 1`.`ip_chunk eth0 2`.`ip_chunk eth0 3`.128/28
+HOST_IP=`ip_chunk eth0 1`.`ip_chunk eth0 2`.`ip_chunk eth0 3`.`ip_chunk eth0 4`
+" >> localrc
+    fi
+    ./stack.sh
+}
+
+function ensure_local_sources() {
+    exclaim "Making sure local sources are up to date..."
+    # this method will only clone if the sources dont exist,
+    # or if RECLONE=yes is set
+    git_clone $REPO_REDDWARF $PATH_REDDWARF $BRANCH_REDDWARF
+    git_clone $REPO_REDDWARFCLIENT $PATH_PYTHON_REDDWARFCLIENT $BRANCH_REDDWARFCLIENT
+}
+
+function cmd_install() {
+    install_prep_packages
+    install_devstack
+    install_devstack_code
+    install_reviews_on_top_of_devstack
+    run_devstack
+    ensure_local_sources
+    install_reddwarf_packages
+    install_diskimagebuilder
+    exclaim "FINISHED INSTALL"
+}
+
+
+
+###############################################################################
+# Build
+###############################################################################
+
+function setup_py() {
+    # Calls setup.py in the given directory.
+    echo "CD into $1"
+    pushd $1
+    sudo python setup.py develop
+    popd
+}
+
+function create_package_repo() {
+    exclaim "Installing Apt Repo...using reprepro"
+    pkg_install reprepro apache2 bc debhelper
+
+    # install the apt repo from /var/www
+    # add distributions file to conf
+    sudo mkdir -p $PACKAGES_DIR/{conf,incoming}
+
+    echo 'Origin: Rackspace
+Label: Rackspace
+Codename: squeeze
+Architectures: i386 amd64
+Components: main
+Description: Rackspace DBaaS APT Repository' | sudo tee $PACKAGES_DIR/conf/distributions
+}
+
+function munge_apache2() {
+	exclaim "Munging configs for apache2 (horizon has altered the default)"
+
+	# If the Additional Listen port is not in the conf, add it
+	is_in_portsfile=`grep 'Listen 8090' /etc/apache2/ports.conf |wc -l`
+    if [ $is_in_portsfile == 0 ]
+    then
+		echo "Listen 8090" | sudo tee -a /etc/apache2/ports.conf
+    fi
+
+    # Add the vhost for 8090 because horizon is using 80, and swift-proxy is using 8080
+	echo "<VirtualHost *:8090>
+
+    DocumentRoot /var/lib/packages
+
+    ErrorLog /var/log/apache2/error.log
+    LogLevel warn
+    CustomLog /var/log/apache2/access.log combined
+</VirtualHost>
+	" | sudo tee /etc/apache2/sites-available/001-apt-repo
+
+	sudo a2ensite 001-apt-repo
+	sudo service apache2 reload
+}
+
+function add_dbass_mycnf_to_package_repo() {
+	exclaim "Building and uploading dbaasmycnf package..."
+	mkdir -p $PACKAGES_DIR
+	mkdir -p $BUILD_DIR
+	cp -R $PATH_REDDWARF/contrib/dbaas-mycnf $BUILD_DIR
+	cd $BUILD_DIR/dbaas-mycnf
+	sudo -E ./builddeb.sh
+	sudo -E reprepro -Vb $PACKAGES_DIR remove squeeze dbaas-mycnf
+	sudo -E reprepro --ignore=wrongdistribution -Vb $PACKAGES_DIR include squeeze *.changes
+}
+
+function cmd_build() {
+    # Run setup.py for all projects.
+    exclaim "Calling setup for all dependencies..."
+    setup_py $PATH_NOVA
+    setup_py $PATH_PYTHON_NOVACLIENT
+    setup_py $PATH_PYTHON_REDDWARFCLIENT
+    setup_py $PATH_REDDWARF
+    create_package_repo
+    munge_apache2
+    add_dbass_mycnf_to_package_repo
+    # Set up the host IP in the apt-repo-list
+    sed -i "s,%network_gateway%,$NETWORK_GATEWAY,g" $REDSTACK_SCRIPTS/files/apt_repo.list
+}
+
+
+###############################################################################
+# Build the image
+# see functions_qemu
+###############################################################################
+
+
+# Grab a numbered field from python prettytable output
+# Fields are numbered starting with 1
+# Reverse syntax is supported: -1 is the last field, -2 is second to last, etc.
+# get_field field-number
+function get_field() {
+    while read data; do
+        if [ "$1" -lt 0 ]; then
+            field="(\$(NF$1))"
+        else
+            field="\$$(($1 + 1))"
+        fi
+        echo "$data" | awk -F'[ \t]*\\|[ \t]*' "{print $field}"
+    done
+}
+
+function get_glance_id () {
+    echo `$@ | grep ' id ' | get_field 2`
+}
+
+function cmd_set_image() {
+    GLANCE_IMAGEID=$1
+    SERVICE_TYPE=$2
+    #TODO(hub-cap): Upload this sucker to our database.
+    # This should be a reddwarf-manage function
+    exclaim "Registering Glance image $GLANCE_IMAGEID with Reddwarf..."
+
+    rd_manage image_update $SERVICE_TYPE $GLANCE_IMAGEID
+}
+
+function upload_image_to_glance() {
+    exclaim "Uploading the image to glance."
+
+    IMAGE_NAME=$1
+    CONTAINER_FORMAT=$2
+    DISK_FORMAT=$3
+    REDDWARF_TENANT=$4
+    IMAGE_LOC=$5
+    SERVICE_TYPE=$6
+
+    GLANCE_IMAGEID=`get_glance_id cmd_glance_client image-create \
+        --name="$IMAGE_NAME" --public \
+        --container-format=$CONTAINER_FORMAT --disk-format=$DISK_FORMAT \
+        --owner=$REDDWARF_TENANT < $IMAGE_LOC`
+
+    echo "IMAGE ID: $GLANCE_IMAGEID"
+    if [ -z "$GLANCE_IMAGEID" ];
+    then
+        echo "Glance upload failed!"
+        exit 1
+    fi
+
+    cmd_set_image $GLANCE_IMAGEID $SERVICE_TYPE
+}
+
+
+###############################################################################
+# Run Unit Tests
+###############################################################################
+
+function cmd_unit_tests() {
+    exclaim "Running Reddwarf Unit Tests..."
+    $PATH_REDDWARF/run_tests.sh -N
+}
+
+###############################################################################
+# Start various OpenStack daemons interactively in a screen session
+###############################################################################
+
+function cmd_start_deps() {
+    if ! sudo vgs $VOLUME_GROUP; then
+        exclaim "Reconnecting Volume Group to Backing File"
+        sudo losetup -f --show ${VOLUME_BACKING_FILE}
+    fi
+    if [[ -e $PATH_DEVSTACK_SRC/stack-screenrc ]]; then
+        screen -dmS stack -c $PATH_DEVSTACK_SRC/stack-screenrc
+    fi
+}
+
+function cmd_stop_deps() {
+    cd $PATH_DEVSTACK_SRC
+    screen -S stack -X quit
+}
+
+
+###############################################################################
+# Initialize Reddwarf
+###############################################################################
+
+function rd_manage() {
+    cd $PATH_REDDWARF
+    bin/reddwarf-manage --config-file=$REDDWARF_CONF_DIR/reddwarf.conf $@
+}
+
+function mod_test_conf() {
+    cp $REDSTACK_SCRIPTS/conf/test_begin.conf $REDDWARF_CONF_DIR/test.conf
+    sed -i "s/\/integration\/report/$ESCAPED_REDSTACK_SCRIPTS\/\.\.\/report/" $REDDWARF_CONF_DIR/test.conf
+    EXTRA_CONF=$REDSTACK_SCRIPTS/conf/test.extra.conf
+    if [ -e $EXTRA_CONF ]; then
+        cat $EXTRA_CONF >> $REDDWARF_CONF_DIR/test.conf
+    fi
+    cat $REDSTACK_SCRIPTS/conf/test_end.conf >> $REDDWARF_CONF_DIR/test.conf
+
+    #Add the paths to the test conf
+    sed -i "s,%keystone_path%,$PATH_KEYSTONE,g" $REDDWARF_CONF_DIR/test.conf
+    sed -i "s,%nova_path%,$PATH_NOVA,g" $REDDWARF_CONF_DIR/test.conf
+    sed -i "s,%glance_path%,$PATH_GLANCE,g" $REDDWARF_CONF_DIR/test.conf
+    sed -i "s,%reddwarf_path%,$PATH_REDDWARF,g" $REDDWARF_CONF_DIR/test.conf
+    sed -i "s,%service_host%,$SERVICE_HOST,g" $REDDWARF_CONF_DIR/test.conf
+    sed -i "s,%swifth_path%,$PATH_SWIFT,g" $REDDWARF_CONF_DIR/test.conf
+}
+
+function cmd_test_init() {
+    exclaim 'Initializing Configuration for Running Tests...'
+
+    echo "Modifying test.conf with appropriate values"
+    mod_test_conf
+
+    exclaim "Creating Keystone Test users..."
+    configure_keystone_for_test_users
+}
+
+function cmd_initialize() {
+    exclaim '(Re)Initializing Reddwarf'
+
+    echo "Stopping Reddwarf Services"
+    cmd_stop
+
+    exclaim "Reinitilizing via devstack local.sh"
+    cd $PATH_DEVSTACK_SRC
+    ./local.sh
+
+    exclaim 'ReInitialize Test Config'
+    cmd_test_init
+}
+
+
+###############################################################################
+# Start Reddwarf specific daemons interactively in a screen session
+###############################################################################
+
+function screen_it {
+    echo "Starting $@..."
+    screen -S stack -X screen -t $1 bash
+    screen -S stack -p $1 -X stuff "$2"$'\015'
+}
+
+function init_fake_mode() {
+    # Create a test conf which, unlike the conf which runs on a user's machine,
+    # takes advantage of the running keystone service we have in our VM.
+    # You could think of this fake mode, which runs in the VM as being
+    # slightly less fake than the default one which runs outside of it.
+    CONF_FILE=/tmp/reddwarf.conf.test
+    cp $PATH_REDDWARF/etc/reddwarf/reddwarf.conf.test $CONF_FILE
+    # Switch keystone from the fake class to the real one.
+    sed -i \
+        "s/reddwarf.tests.fakes.keystone/keystone.middleware.auth_token/g" \
+        $CONF_FILE
+    sed -i "s/log_file = rdtest.log//g" $CONF_FILE
+    cd $PATH_REDDWARF
+    set -e
+    rm -f reddwarf_test.sqlite
+    set +e
+    bin/reddwarf-manage --config-file=$CONF_FILE db_sync
+    sqlite3 reddwarf_test.sqlite \
+        "INSERT INTO service_images VALUES('1','mysql','fake');"
+}
+
+function cmd_start() {
+    screen_it rd-api "cd $PATH_REDDWARF; bin/reddwarf-api --config-file=$REDDWARF_CONF_DIR/reddwarf.conf 2>&1 | tee $REDDWARF_LOGDIR/reddwarf-api.log"
+    screen_it rd-tmgr "cd $PATH_REDDWARF; bin/reddwarf-taskmanager --config-file=$REDDWARF_CONF_DIR/reddwarf-taskmanager.conf 2>&1 | tee $REDDWARF_LOGDIR/reddwarf-taskmanager.log"
+}
+
+function cmd_start_fake() {
+    init_fake_mode
+    CONF_FILE=/tmp/reddwarf.conf.test
+    screen_it rd-fake "cd $PATH_REDDWARF; bin/reddwarf-api --config-file=$CONF_FILE $@"
+}
+
+function cmd_run() {
+    cd $PATH_REDDWARF; bin/reddwarf-api \
+        --config-file=$REDDWARF_CONF_DIR/reddwarf.conf $@
+}
+
+function cmd_run_fake() {
+    init_fake_mode
+    CONF_FILE=/tmp/reddwarf.conf.test
+    bin/reddwarf-api --config-file=$CONF_FILE $@ \
+        repo_path=reddwarf_test.sqlite
+}
+
+###############################################################################
+# Stop any active Reddwarf screen session
+###############################################################################
+###############################################################################
+
+function cmd_stop() {
+    screen -S stack -p rd-api -X stuff $'\003 exit \015'
+    screen -S stack -p rd-tmgr -X stuff $'\003 exit \015'
+    screen -S stack -p rd-fake -X stuff $'\003 exit \015'
+}
+
+
+###############################################################################
+# Run Integration Tests
+###############################################################################
+
+function cmd_int_tests() {
+    exclaim "Running Reddwarf Integration Tests..."
+    cd $REDSTACK_SCRIPTS
+    export TEST_CONF=$REDDWARF_CONF_DIR/test.conf
+    if [ $# -lt 1 ]; then
+        args="--group=blackbox"
+    else
+        args="$@"
+    fi
+
+    # -- verbose makes it prettier.
+    # -- logging-clear-handlers keeps the novaclient and other things from
+    #    spewing logs to stdout.
+    args="$INT_TEST_OPTIONS -B $REDSTACK_TESTS/integration/int_tests.py --verbose --logging-clear-handlers $args"
+    echo "python $args"
+    python $args
+}
+
+function cmd_int_tests_simple() {
+    exclaim "Running Reddwarf Simple Integration Tests..."
+    cd $REDSTACK_SCRIPTS
+    export TEST_CONF=$REDDWARF_CONF_DIR/test.conf
+    if [ $# -lt 1 ]; then
+        args="--group=simple_blackbox"
+    else
+        args="$@"
+    fi
+
+    # -- verbose makes it prettier.
+    # -- logging-clear-handlers keeps the novaclient and other things from
+    #    spewing logs to stdout.
+    args="$INT_TEST_OPTIONS -B $REDSTACK_TESTS/integration/int_tests.py --verbose --logging-clear-handlers $args"
+    echo "python $args"
+    python $args
+}
+
+function cmd_int_tests_white_box() {
+    export PYTHONPATH=$PYTHONPATH:$REDDWARF_SOURCE
+    export PYTHONPATH=$PYTHONPATH:$PATH_NOVA
+    cmd_int_tests --test-config white_box=True \
+        --config-file=$REDDWARF_CONF_DIR/reddwarf.conf \
+        --nova-flags=/etc/nova/nova.conf $@
+}
+
+function cmd_example_tests() {
+    set +e
+    cmd_stop
+    set -e
+    cmd_start_fake
+    sleep 3
+    echo "
+{
+    \"directory\": \"$REDSTACK_TESTS/../apidocs/src/resources/samples/\",
+    \"auth_url\":\"http://localhost:35357/v2.0/tokens\",
+    \"api_url\":\"http://localhost:8779\",
+    \"replace_host\":\"https://ord.databases.api.rackspacecloud.com\",
+    \"replace_dns_hostname\": \"e09ad9a3f73309469cf1f43d11e79549caf9acf2.rackspaceclouddb.com\",
+    \"username\":\"examples\",
+    \"password\":\"examples\",
+    \"tenant\":\"reddwarf\"
+}" > /tmp/example-tests.conf
+    python $REDSTACK_TESTS/examples/examples/example_generation.py /tmp/example-tests.conf
+    pushd $REDSTACK_TESTS/../apidocs
+    mvn clean
+    mvn generate-sources
+    popd
+    cmd_stop
+}
+
+###############################################################################
+# Misc. tools
+###############################################################################
+
+function mysql_nova() {
+    echo mysql nova --execute "$@"
+    mysql -u root -p$MYSQL_PASSWORD nova --execute "$@"
+}
+
+function mysql_reddwarf() {
+    echo mysql reddwarf --execute "$@"
+    mysql -u root -p$MYSQL_PASSWORD reddwarf --execute "$@"
+}
+
+function cmd_nova_client() {
+    # This serves as an example of how to call the Nova client script.
+    TESTVOLUME=`echo "$@" | awk '/volume/{print $1}'`
+    if [ -z "$TESTVOLUME" -o "$TESTVOLUME" = "volume-attach" -o "$TESTVOLUME" = "volume-detach" ]; then
+        nova --os_auth_url=http://localhost:35357/v2.0 \
+            --os_tenant_name=reddwarf --os_username=radmin --os_password=radmin \
+            --service_type=compute --region_name=RegionOne \
+            --service_name='nova' $@
+    else
+        nova --os_auth_url=http://localhost:35357/v2.0 \
+            --os_tenant_name=reddwarf --os_username=radmin --os_password=radmin \
+            --service_type=volume --region_name=RegionOne \
+            --service_name='cinder' $@
+    fi
+}
+
+function cmd_swift_client() {
+    swift --os_auth_url=http://localhost:35357/v2.0 \
+            --os_tenant_name=reddwarf --os_username=radmin --os_password=radmin $@
+}
+
+function cmd_glance_client() {
+    REDDWARF_TENANT=`get_attribute_id tenant reddwarf 1`
+    glance --os-auth-url=http://localhost:35357/v2.0 \
+        --os-username=radmin --os-password=radmin \
+        --os-tenant-id $REDDWARF_TENANT $@
+}
+
+function cmd_rd_client() {
+    # This serves as an example of how to call the Reddwarf client script.
+    reddwarf-cli --username=radmin --apikey=radmin --tenant=reddwarf \
+        --auth_url=http://localhost:35357/v2.0/tokens auth login
+    reddwarf-cli $@
+}
+
+function cmd_rd_mgmt_client() {
+    # This serves as an example of how to call the Reddwarf managment client script.
+    reddwarf-cli --username=radmin --apikey=radmin --tenant=reddwarf \
+        --auth_url=http://localhost:35357/v2.0/tokens auth login
+    reddwarf-mgmt-cli $@
+}
+
+function cmd_delete_nova_instance() {
+    # Nova will not let you delete an instance whose state is error, but we
+    # won't let that stop us.
+    echo "Deleting instance $1..."
+    mysql_nova "UPDATE instances SET vm_state='active' WHERE vm_state='error' AND uuid='$1';"
+    cmd_nova_client delete $1
+}
+
+function cmd_wipe_logs() {
+    for file in `ls $REDDWARF_LOGDIR/*.log`
+    do
+        echo "Reseting log file $file..."
+        echo "Reset at `date`" > $file
+    done
+}
+
+function cmd_rd_sql() {
+    mysql -u root -p$MYSQL_PASSWORD reddwarf
+}
+
+function cmd_fake_sql() {
+    pushd $PATH_REDDWARF
+    sqlite3 reddwarf_test.sqlite $@
+    popd
+}
+
+function cmd_vagrant_ssh() {
+    # Runs a command on a vagrant VM from the host machine.
+    VHOST=`vagrant ssh_config host | awk '/HostName/{print $2}'`
+    VUSER=`vagrant ssh_config host | awk '/User /{print $2}'`
+    VPORT=`vagrant ssh_config host | awk '/Port/{print $2}'`
+    VIDFILE=`vagrant ssh_config host | awk '/IdentityFile/{print $2}'`
+    echo ssh ${VUSER}@${VHOST} -p ${VPORT} -i ${VIDFILE} -o NoHostAuthenticationForLocalhost=yes "$@"
+    ssh ${VUSER}@${VHOST} -p ${VPORT} -i ${VIDFILE} -o NoHostAuthenticationForLocalhost=yes "$@"
+}
+
+
+function cmd_run_ci() {
+    exclaim "Running CI suite..."
+    set +e
+    cmd_stop_deps
+    cmd_stop
+    set -e
+    cmd_install
+    cmd_build
+    cmd_test_init
+    # The arg will be the image type
+    cmd_build_image $1
+
+    # Test in fake mode.
+    exclaim "Testing in fake mode."
+    cmd_start_fake
+    FAKE_MODE=True cmd_int_tests
+    cmd_stop
+
+    # Test in real mode.
+    exclaim "Testing in real mode."
+    cmd_start
+    FAKE_MODE=False cmd_int_tests
+}
+
+function cmd_wipe_queues() {
+    # Obliterate rabbit.
+    for i in stop_app reset start_app "change_password guest $RABBIT_PASSWORD"; \
+    do sudo rabbitmqctl $i; done
+}
+
+function cmd_clear() {
+    cmd_int_tests --group=dbaas.api.instances.delete
+    clean_instances
+    mysql_nova "DELETE FROM instance_info_caches;"
+    mysql_nova "DELETE FROM instances;"
+    mysql_reddwarf "DELETE FROM instances;"
+    mysql_reddwarf "DELETE FROM service_statuses;"
+    cmd_wipe_queues
+}
+
+function cmd_kick_start() {
+    cmd_build
+    cmd_test_init
+    cmd_build_image $1
+}
+
+function cmd_post_devstack() {
+    install_reddwarf_packages
+    install_diskimagebuilder
+    cmd_build
+    cmd_test_init
+    cmd_build_image $1
+}
+
+function cmd_reset_task() {
+    mysql_reddwarf "UPDATE instances SET task_id=1 WHERE id='$1'"
+}
+
+function cmd_update_projects() {
+  for project in $(cat $REDSTACK_SCRIPTS/projects-list); do
+     if [ ! -d $PATH_DEVSTACK_OUTPUT/$project ]; then
+          echo "Creating a new clone of $project..."
+          git_clone https://github.com/openstack/"$project".git ${PATH_DEVSTACK_OUTPUT}/$project master
+      else
+          echo "$project was already cloned or exists pulling changes"
+          cd $PATH_DEVSTACK_OUTPUT/$project
+          git pull
+      fi
+  done
+}
+
+function cmd_repl() {
+    INT_TEST_OPTIONS=-i cmd_int_tests_white_box --repl --group=_does_not_exist_ $@
+}
+
+###############################################################################
+# Process the user provided command and run the appropriate command
+###############################################################################
+
+# Let's not run this as the root user
+if [ $EUID -eq 0 ]; then
+   echo "You are running this script as root. You need to run as a regular user"
+   exit 1
+fi
+
+# Set this to exit immediately on error
+set -o errexit
+
+set_home_dir
+set_http_proxy
+
+function print_usage() {
+    echo "Usage: $0 [command]"
+    echo "
+    Commands :
+        --setup environment--
+          install         - Install all the required dependencies and bring up rd-api and rd-tmgr
+          build           - Build the packages (including the agent) and set up the apt repo
+          test-init       - Configure the test configuration files and add keystone test users
+          build-image     - Builds the vm image and adds it to glance
+          initialize      - Reinitialize the reddwarf database, users, services, and test config
+          post-devstack   - Configures testing environment, builds image and uploads to glance
+
+        --helper for environment--
+          kick-start      - kick start the setup of reddwarf.
+                            (redstack build/test-init/build-image in one step)
+                            [mysql no-clean] no clean avoids rebuilding pacakges from scratch
+
+        --reddwarf dependency services--
+          start-deps      - Start or resume daemons Reddwarf depends on.
+          stop-deps       - Kill daemons Reddwarf depends on.
+
+        --reddwarf services--
+          start           - Start or resume daemons Reddwarf depends on.
+          stop            - Kill daemons Reddwarf depends on.
+
+        --tests--
+          unit-tests      - Run the unit tests.dependencies
+          int-tests       - Runs the integration tests (requires all daemons).
+          simple-tests    - Runs the simple integration tests (requires all daemons).
+
+        --tools--
+          debug           - Debug this script (shows all commands).
+          glance-client   - Runs glance client with admin user.
+          nova-client     - Runs Nova client with admin user.
+          swift-client    - Runs Swift client with admin user.
+          rd-client       - Runs Reddwarf client with admin user.
+          rd-mgmt-client  - Runs Reddwarf management client with admin user.
+                            * Shows a valid token.
+          wipe-logs       - Resets all log files.
+          nova-delete     - Deletes a nova instance.
+          rd-sql          - Opens the Reddwarf MySQL database.
+          vagrant-ssh     - Runs a command from the host on the server.
+          set-image       - Sets the image without building it.
+          clear           - Destroy instances and rabbit queues.
+          run             - Starts RD but not in a screen.
+          run-fake        - Runs the server in fake mode.
+          update-projects - Git pull on all the daemons reddwarf dependencies.
+          reset-task      - Sets an instance task to NONE.
+          wipe-queues     - Resets RabbitMQ queues.
+    "
+    exit 1
+}
+
+function run_command() {
+    # Print the available commands
+    if [ $# -lt 1 ]; then
+        print_usage
+    fi
+
+    case "$1" in
+        "install" ) cmd_install;;
+        "build" ) cmd_build;;
+        "test-init" ) cmd_test_init;;
+        "build-image" ) shift; cmd_build_image $@;;
+        "initialize" ) cmd_initialize;;
+        "post-devstack" ) shift; cmd_post_devstack $@;;
+        "unit-tests" ) cmd_unit_tests;;
+        "start-deps" ) cmd_start_deps;;
+        "stop-deps" ) cmd_stop_deps;;
+        "start" ) cmd_start;;
+        "int-tests" ) shift; cmd_int_tests $@;;
+        "int-tests-wb" ) shift; cmd_int_tests_white_box $@;;
+        "simple-tests") shift; cmd_int_tests_simple $@;;
+        "stop" ) cmd_stop;;
+        "glance-client" ) shift; cmd_glance_client;;
+        "nova-client" ) shift; cmd_nova_client $@;;
+        "rd-client" ) shift; cmd_rd_client $@;;
+        "rd-mgmt-client" ) shift; cmd_rd_mgmt_client $@;;
+        "swift-client" ) shift; cmd_swift_client $@;;
+        "nova-delete" ) shift; cmd_delete_nova_instance $@;;
+        "wipe-logs" ) cmd_wipe_logs;;
+        "rd-sql" ) shift; cmd_rd_sql $@;;
+        "fake-sql" ) shift; cmd_fake_sql $@;;
+        "run-ci" ) shift; cmd_run_ci $@;;
+        "vagrant-ssh" ) shift; cmd_vagrant_ssh $@;;
+        "debug" ) shift; echo "Enabling debugging."; \
+                  set -o xtrace; run_command $@;;
+        "set-image" ) shift; cmd_set_image $@;;
+        "clear" ) shift; cmd_clear $@;;
+        "run" ) shift; cmd_run $@;;
+        "kick-start" ) shift; cmd_kick_start $@;;
+        "run-fake" ) shift; cmd_run_fake $@;;
+        "start-fake" ) shift; cmd_start_fake $@;;
+        "update-projects" ) cmd_update_projects;;
+        "reset-task" ) shift; cmd_reset_task $@;;
+        "wipe-queues" ) shift; cmd_wipe_queues $@;;
+        "example-tests" ) shift; cmd_example_tests $@;;
+        "repl" ) shift; cmd_repl $@;;
+        * )
+            echo "'$1' not a valid command"
+            exit 1
+    esac
+}
+
+run_command $@
